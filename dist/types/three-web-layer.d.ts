@@ -1,5 +1,4 @@
 import * as THREE from 'three';
-import 'babel-polyfill';
 export interface WebLayer3DOptions {
     pixelRatio?: number;
     layerSeparation?: number;
@@ -47,10 +46,12 @@ export default class WebLayer3D extends THREE.Object3D {
     options: WebLayer3DOptions;
     rootLayer: WebLayer3D;
     private _level;
+    static DEBUG: boolean;
     static LAYER_ATTRIBUTE: string;
     static LAYER_CONTAINER_ATTRIBUTE: string;
     static PIXEL_RATIO_ATTRIBUTE: string;
     static STATES_ATTRIBUTE: string;
+    static HOVER_DEPTH_ATTRIBUTE: string;
     private static DISABLE_TRANSFORMS_ATTRIBUTE;
     static DEFAULT_LAYER_SEPARATION: number;
     static DEFAULT_PIXEL_DIMENSIONS: number;
@@ -58,46 +59,43 @@ export default class WebLayer3D extends THREE.Object3D {
     static TRANSITION_DEFAULT: (layer: WebLayer3D, alpha?: number) => void;
     static transitionLayout(layer: WebLayer3D, alpha: number): void;
     static transitionVisibility(layer: WebLayer3D, alpha: number): void;
+    private static _hoverLayers;
+    private static _updateInteractions;
+    private static _scheduleRasterizations;
+    private static _clearHover;
+    private static _setHover;
+    private static _setHoverClass;
     private static _updateInteraction;
     private static _didInstallStyleSheet;
     element: HTMLElement;
     content: THREE.Object3D;
-    textures: {
-        [state: string]: THREE.Texture;
-    };
     mesh: THREE.Mesh;
     depthMaterial: THREE.MeshDepthMaterial;
     childLayers: WebLayer3D[];
     targetContentPosition: THREE.Vector3;
     targetContentScale: THREE.Vector3;
-    boundingRect: {
-        left: number;
-        top: number;
-        width: number;
-        height: number;
-    };
     cursor: THREE.Object3D;
-    needsRefresh: boolean;
+    needsRasterize: boolean;
     private _lastTargetContentPosition;
     private _lastTargetContentScale;
-    private _isRefreshing;
     private _isUpdating;
     private _needsRemoval;
     private _needsHiding;
     private _hover;
+    private _hoverDepth;
     private _states;
     private _pixelRatio;
     private _state;
     private _raycaster;
     private _hitIntersections;
+    private _rasterizationQueue;
     private _mutationObserver?;
     private _resizeObserver?;
     private _resourceLoader?;
     private _fontMetrics?;
     private _logger?;
     private _meshMap;
-    private _interactionRays?;
-    private _interactionMap;
+    private _interactionRays;
     private _triggerRefresh?;
     private _processMutations?;
     constructor(element: Element, options?: WebLayer3DOptions, rootLayer?: WebLayer3D, _level?: number);
@@ -106,16 +104,23 @@ export default class WebLayer3D extends THREE.Object3D {
      * Note: if a state is not available, the `default` state will be rendered.
      */
     state: string;
+    readonly texture: THREE.Texture;
+    readonly bounds: {
+        left: number;
+        top: number;
+        width: number;
+        height: number;
+    };
     /**
      * A list of Rays to be used for interaction.
      * Can only be set on a root WebLayer3D instance.
      * @param rays
      */
-    interactionRays: THREE.Ray[] | undefined | null;
+    interactionRays: THREE.Ray[];
     /**
      * Get the hover state
      */
-    readonly hover: boolean;
+    readonly hover: number;
     /**
      * Get the layer level
      */
@@ -128,7 +133,6 @@ export default class WebLayer3D extends THREE.Object3D {
      * This should be called each frame, and can only be called on a root WebLayer3D instance.
      *
      * @param alpha lerp value
-     * @param children if true, also update child layers. Default is true.
      * @param transition transition function. Default is WebLayer3D.TRANSITION_DEFAULT
      */
     update(alpha?: number, transition?: (layer: WebLayer3D, alpha: number) => void): void;
@@ -138,20 +142,21 @@ export default class WebLayer3D extends THREE.Object3D {
     getLayerForElement(element: Element): WebLayer3D | undefined;
     hitTest(ray: THREE.Ray): {
         layer: WebLayer3D;
-        intersection: import("three/src/core/Raycaster").Intersection;
+        intersection: THREE.Intersection;
         target: HTMLElement;
     } | undefined;
-    refresh(force?: boolean): Promise<void>;
+    refresh(forceRasterize?: boolean): void;
     dispose(): void;
     private _updateState;
     private _checkRoot;
-    private _updateDefaultLayout;
+    private _updateBounds;
+    private _updateTargetLayout;
     private _updateMesh;
-    private _updateInteractions;
     private _showChildLayers;
     private _disableTransforms;
+    private _setHoverClasses;
     private _markForRemoval;
     private _updateChildLayers;
     private _tryConvertToWebLayer3D;
-    private _renderTextures;
+    private _rasterize;
 }

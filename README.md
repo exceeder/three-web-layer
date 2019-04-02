@@ -1,5 +1,9 @@
 # three-web-layer
-A handy tool for rendering DOM layouts in three.js, built on html2canvas
+A handy tool for rendering complex and interactive 2D web content in WebGL using three.js, built on html2canvas
+
+## Motivation
+
+The goal of this project is to leverage the power of the 2D web for layout and design of content presented in a 3D environment.
 
 ## DEMO
 
@@ -9,7 +13,7 @@ A handy tool for rendering DOM layouts in three.js, built on html2canvas
 
 ```bash
 npm i three-web-layer
-```
+``` 
 
 ## API
 
@@ -92,16 +96,12 @@ function animate() {
 }
 ```
 
-    Note: See the example source code for more details, which roughly follows the above setup while presenting web content built with Vue.js and JSX (just an example, the only dependencies of WebLayer3D are threejs, WebGL, and DOM).
+*Note: See the example source code for more details, which roughly follows the above setup while presenting web content built with Vue.js and JSX (just an example, the only dependencies of WebLayer3D are threejs, WebGL, and DOM).*
 
-When an instance is created, a `layer` data-attribute is set on
-the passed DOM element to match this instance's Object3D id.
-If the passed DOM element has an `id` attribute, this instance's Object3D name
-will be set to match the element id.
+When a WebLayer3D instance is created, a `layer` data-attribute is set on
+the DOM element to match the `id` property (inherited from Object3D). Likewise, the name property will be set to match the element id (allowing `scene.getObjectByName(<dom-id>)`).
 
-Child WebLayer3D instances can be specified with an empty `layer` data-attribute,
-which will be set when the child WebLayer3D instance is created automatically.
-The data-attribute can be specified added in HTML or dynamically:
+Child WebLayer3D instances can be created by adding a `layer` data-attribute to the intended DOM element. The `layer` data-attribute can be added in HTML or dynamically:
  - `<div data-layer></div>`
  - `element.dataset.layer = ''`
 
@@ -109,12 +109,11 @@ Additionally, the pixel ratio can be adjusted on each layer, individually:
  - `<div data-layer data-layer-pixel-ratio="0.5"></div>`
  - `element.dataset.layerPixelRatio = '0.5'`
 
-Finally, each layer can prerender multipe states specified as CSS classes delimited by spaces:
+Finally, each layer can prerender multipe states specified similarly to CSS classes:
  - `<div data-layer data-layer-states="near far"></div>`
  - `element.dataset.layerStates = 'near far'`
 
-Each WebLayer3D will render each of its states with the corresponding CSS class applied to the element.
-Every layer has a `default` state. The texture can be changed with `layer.setState(state)`,
+Each WebLayer3D will render each of its states with the corresponding CSS class applied to the element. The texture state can then be changed with `layer.setState(state)`, 
 without requiring the DOM to be re-rendered. Setting a state on a parent layer does
 not affect the state of a child layer. 
 
@@ -129,4 +128,4 @@ Default dimensions:
 - Relies on html2canvas, which means many CSS styles may not render correctly. 
 - Tainting the canvas will prevent the layer from rendering. This includes cross-origin resources loaded without CORS, and (in Safari) data-urls for images
 - Anything not within the bounds of the passed element will be clipped. If you want to render a child element that is outside of the bounds of a parent layer element, the descendent element must also be made into a WebLayer3D instance (by adding a `data-layer` attribute)
-- Mutation observers, resize observers, and event listeners are attached to the root element in order to automatically refresh textures when changes are detected. It's possible that some changes to the DOM can be missed (e.g., stylesheets can be changed). To manually trigger a forced refresh on a layer and it's descendent layers, call ``layer.refresh(true)`. Alternatively, set `layer.needsRefresh = true` on every layer that needs a refresh, and then call `refresh()` on the root layer to refresh only the layers that are marked as needing a refresh. 
+- Mutation observers, resize observers, and event listeners are attached to the root element in order to automatically refresh textures when changes are detected. It's possible that some changes to the DOM can be missed (e.g., stylesheets can be changed). To manually trigger a forced rasterize on a layer and it's descendent layers, call `layer.refresh(true)`. Alternatively, set `layer.needsRasterize = true` on every layer that needs to be rasterized, and then call `refresh()` on the root layer to rasterize the layers that are marked. 

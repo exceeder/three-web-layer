@@ -1,15 +1,12 @@
 import * as THREE from 'three'
 import ResizeObserver from 'resize-observer-polyfill'
-import 'babel-polyfill'
 
-// import html2canvas from '@speigg/html2canvas/dist/npm/index'
 import { NodeParser } from '@speigg/html2canvas/dist/npm/NodeParser'
 import Logger from '@speigg/html2canvas/dist/npm/Logger'
 import CanvasRenderer from '@speigg/html2canvas/dist/npm/renderer/CanvasRenderer'
 import Renderer from '@speigg/html2canvas/dist/npm/Renderer'
 import ResourceLoader from '@speigg/html2canvas/dist/npm/ResourceLoader'
 import { FontMetrics } from '@speigg/html2canvas/dist/npm/Font'
-import { parseBounds } from '@speigg/html2canvas/dist/npm/Bounds'
 
 export interface WebLayer3DOptions {
   pixelRatio?: number
@@ -57,10 +54,12 @@ export type WebLayerHit = ReturnType<typeof WebLayer3D.prototype.hitTest> & {}
  *     e.g., 500px width means 0.5meters
  */
 export default class WebLayer3D extends THREE.Object3D {
+  static DEBUG = false
   static LAYER_ATTRIBUTE = 'data-layer'
   static LAYER_CONTAINER_ATTRIBUTE = 'data-layer-container'
   static PIXEL_RATIO_ATTRIBUTE = 'data-layer-pixel-ratio'
   static STATES_ATTRIBUTE = 'data-layer-states'
+  static HOVER_DEPTH_ATTRIBUTE = 'data-layer-hover-depth'
   private static DISABLE_TRANSFORMS_ATTRIBUTE = 'data-layer-disable-transforms'
 
   static DEFAULT_LAYER_SEPARATION = 0.005
@@ -96,18 +95,95 @@ export default class WebLayer3D extends THREE.Object3D {
     }
   }
 
-  private static _updateInteraction = function(
-    layer: WebLayer3D,
-    interactions: Map<WebLayer3D, { point: THREE.Vector3 }>
-  ) {
-    const interaction = interactions.get(layer)
-    if (interaction) {
-      layer._hover = true
-      layer.cursor.position.copy(interaction.point)
+  private static _hoverLayers = new Set<WebLayer3D>()
+  private static _updateInteractions(rootLayer: WebLayer3D) {
+    rootLayer.updateWorldMatrix(true, true)
+    rootLayer.traverseLayers(WebLayer3D._clearHover)
+    WebLayer3D._hoverLayers.clear()
+    for (const ray of rootLayer._interactionRays) {
+      rootLayer._hitIntersections.length = 0
+      rootLayer._raycaster.ray.copy(ray)
+      rootLayer._raycaster.intersectObject(rootLayer, true, rootLayer._hitIntersections)
+      for (const intersection of rootLayer._hitIntersections) {
+        const layer = rootLayer._meshMap!.get(intersection.object as any)
+        if (layer && !layer.needsHiding) {
+          WebLayer3D._hoverLayers.add(layer)
+          layer._hover = 1
+          WebLayer3D._updateInteraction(layer, intersection.point)
+        }
+      }
+    }
+    rootLayer.traverseLayers(WebLayer3D._setHover)
+    traverseDOM(rootLayer.element, WebLayer3D._setHoverClass)
+  }
+
+  private static async _scheduleRasterizations(rootLayer: WebLayer3D) {
+    const queue = rootLayer._rasterizationQueue
+    if (window.requestIdleCallback) {
+      if (queue.length)
+        window.requestIdleCallback(idleDeadline => {
+          if (!queue.length) return
+          if (WebLayer3D.DEBUG) performance.mark('rasterize queue start')
+          while (queue.length && idleDeadline.timeRemaining() > 0) {
+            if (WebLayer3D.DEBUG) performance.mark('rasterize start')
+            queue.shift()!._rasterize()
+            if (WebLayer3D.DEBUG) performance.mark('rasterize end')
+            if (WebLayer3D.DEBUG)
+              performance.measure('rasterize', 'rasterize start', 'rasterize end')
+          }
+          if (WebLayer3D.DEBUG) performance.mark('rasterize queue end')
+          if (WebLayer3D.DEBUG)
+            performance.measure('rasterize queue', 'rasterize queue start', 'rasterize queue end')
+        })
+    } else {
+      await null // wait for render to complete
+      if (!queue.length) return
+      const startTime = performance.now()
+      if (WebLayer3D.DEBUG) performance.mark('rasterize queue start')
+      while (queue.length && performance.now() - startTime < 5) {
+        if (WebLayer3D.DEBUG) performance.mark('rasterize start')
+        queue.shift()!._rasterize()
+        if (WebLayer3D.DEBUG) performance.mark('rasterize end')
+        if (WebLayer3D.DEBUG) performance.measure('rasterize', 'rasterize start', 'rasterize end')
+      }
+      if (WebLayer3D.DEBUG) performance.mark('rasterize queue end')
+      if (WebLayer3D.DEBUG)
+        performance.measure('rasterize queue', 'rasterize queue start', 'rasterize queue end')
+    }
+  }
+
+  private static _clearHover = function(layer: WebLayer3D) {
+    layer._hover = 0
+    layer.remove(layer.cursor)
+  }
+
+  private static _setHover = function(layer: WebLayer3D) {
+    layer._hover =
+      layer._hover === 0 && layer.parent instanceof WebLayer3D && layer.parent._hover > 0
+        ? layer.parent._hover + 1
+        : layer._hover
+  }
+
+  private static _setHoverClass = function(element: HTMLElement) {
+    const hoverLayers = WebLayer3D._hoverLayers
+    let hover = false
+    for (const layer of hoverLayers) {
+      if (element.contains(layer.element)) {
+        hover = true
+        break
+      }
+    }
+    if (hover && !element.classList.contains('hover')) element.classList.add('hover')
+    if (!hover && element.classList.contains('hover')) element.classList.remove('hover')
+    return true
+  }
+
+  private static _updateInteraction = function(layer: WebLayer3D, point: THREE.Vector3) {
+    if (layer.hover === 1) {
+      layer.cursor.position.copy(point)
       layer.worldToLocal(layer.cursor.position)
       layer.add(layer.cursor)
     } else {
-      layer._hover = false
       layer.remove(layer.cursor)
     }
   }
@@ -116,49 +192,53 @@ export default class WebLayer3D extends THREE.Object3D {
 
   element: HTMLElement
   content = new THREE.Object3D()
-  textures: { [state: string]: THREE.Texture } = {}
   mesh = new THREE.Mesh(
     WebLayer3D.GEOMETRY,
     new THREE.MeshBasicMaterial({
+      depthTest: false,
       transparent: true,
       opacity: 0
     })
   )
   depthMaterial = new THREE.MeshDepthMaterial({
-    // depthPacking: THREE.RGBADepthPacking,
-    alphaTest: 0.5
+    depthPacking: THREE.RGBADepthPacking,
+    alphaTest: 0.1
   } as any)
 
   childLayers: WebLayer3D[] = []
   targetContentPosition = new THREE.Vector3()
   targetContentScale = new THREE.Vector3(0.1, 0.1, 0.1)
-  boundingRect = { left: 0, top: 0, width: 0, height: 0 }
   cursor = new THREE.Object3D()
-  needsRefresh = true
+  needsRasterize = true
 
   private _lastTargetContentPosition = new THREE.Vector3()
   private _lastTargetContentScale = new THREE.Vector3(0.1, 0.1, 0.1)
 
-  private _isRefreshing = false
-  private _isUpdating = false
+  private _isUpdating = false // true while in WebLayer3D#update() function
   private _needsRemoval = false
   private _needsHiding = false
-  private _hover = false
-  private _states!: string[]
+  private _hover = 0
+  private _hoverDepth = 0
+  private _states: {
+    [state: string]: {
+      texture: THREE.Texture
+      bounds: { left: number; top: number; width: number; height: number }
+    }[]
+  } = {}
   private _pixelRatio = 1
   private _state = ''
   private _raycaster = new THREE.Raycaster()
   private _hitIntersections = this._raycaster.intersectObjects([]) // for type inference
 
   // the following properties are meant to be accessed on the root layer
+  private _rasterizationQueue = [] as WebLayer3D[]
   private _mutationObserver?: MutationObserver
   private _resizeObserver?: ResizeObserver
   private _resourceLoader?: any
   private _fontMetrics?: any
   private _logger?: any
   private _meshMap = new WeakMap<THREE.Mesh, WebLayer3D>()
-  private _interactionRays?: THREE.Ray[] | null
-  private _interactionMap = new Map<WebLayer3D, { point: THREE.Vector3 }>()
+  private _interactionRays = [] as THREE.Ray[]
   private _triggerRefresh?: any
   private _processMutations?: any
 
@@ -184,9 +264,7 @@ export default class WebLayer3D extends THREE.Object3D {
       document.head.append(style)
       addCSSRule(
         style.sheet as CSSStyleSheet,
-        `[${WebLayer3D.DISABLE_TRANSFORMS_ATTRIBUTE}], [${
-          WebLayer3D.DISABLE_TRANSFORMS_ATTRIBUTE
-        }] *`,
+        `[${WebLayer3D.DISABLE_TRANSFORMS_ATTRIBUTE}] *`,
         'transform: none !important;',
         0
       )
@@ -194,20 +272,26 @@ export default class WebLayer3D extends THREE.Object3D {
     }
 
     this.add(this.content)
-    this.mesh.renderOrder = this.level
     this.mesh.visible = false
-    this.mesh['customDepthMaterial'] = new THREE.MeshDepthMaterial()
+    this.mesh['customDepthMaterial'] = this.depthMaterial
     this.rootLayer._meshMap!.set(this.mesh, this)
 
     if (this.rootLayer === this) {
       this._triggerRefresh = (e: Event) => {
         const layer = this.getLayerForElement(e.target as any)!
         if (layer) {
-          layer.needsRefresh = true
-          layer.refresh()
+          layer.needsRasterize = true
         }
       }
-      const setLayerNeedsRefresh = layer => (layer.needsRefresh = true)
+      element.addEventListener('input', this._triggerRefresh, { capture: true })
+      element.addEventListener('change', this._triggerRefresh, { capture: true })
+      // element.addEventListener('focus', this._triggerRefresh, { capture: true })
+      element.addEventListener('transitionend', this._triggerRefresh, { capture: true })
+
+      let target: HTMLElement | null
+      const setLayerNeedsRasterize = (layer: WebLayer3D) => {
+        if (target!.contains(layer.element)) layer.needsRasterize = true
+      }
       this._processMutations = (records: MutationRecord[]) => {
         if (this._isUpdating) return
         for (const record of records) {
@@ -221,27 +305,45 @@ export default class WebLayer3D extends THREE.Object3D {
             (record.target as CharacterData).data === record.oldValue
           )
             continue
-          const target =
+          target =
             record.target.nodeType === Node.ELEMENT_NODE
               ? (record.target as HTMLElement)
               : record.target.parentElement
-          if (!target) {
-            continue
-          }
+          if (!target) continue
           const layer = this.getLayerForElement(target)
-          if (layer) {
-            if (record.type === 'childList') {
-              layer.traverse(setLayerNeedsRefresh)
-            } else layer.needsRefresh = true
+          if (!layer) continue
+          if (record.type === 'attributes' && record.attributeName === 'class') {
+            const oldClasses = record.oldValue ? record.oldValue.split(/\s+/) : []
+            const currentClasses = (record.target as HTMLElement).className.split(/\s+/)
+            const addedClasses = arraySubtract(currentClasses, oldClasses)
+            const removedClasses = arraySubtract(oldClasses, currentClasses)
+            let needsRasterize = false
+            for (const c of removedClasses) {
+              if (c === 'hover') {
+                continue
+              }
+              if (layer._states[c]) {
+                layer.state = ''
+                continue
+              }
+              needsRasterize = true
+            }
+            for (const c of addedClasses) {
+              if (c === 'hover') {
+                continue
+              }
+              if (layer._states[c]) {
+                layer.state = c
+                continue
+              }
+              needsRasterize = true
+            }
+            if (!needsRasterize) continue
           }
+          layer.needsRasterize = true
+          layer.traverseLayers(setLayerNeedsRasterize)
         }
-        this.refresh()
       }
-
-      element.addEventListener('input', this._triggerRefresh, { capture: true })
-      element.addEventListener('change', this._triggerRefresh, { capture: true })
-      // element.addEventListener('focus', this._triggerRefresh, { capture: true })
-      // element.addEventListener('transitionend', this._triggerRefresh, { capture: true })
 
       this._mutationObserver = new MutationObserver(this._processMutations)
       this._mutationObserver.observe(element, {
@@ -252,15 +354,6 @@ export default class WebLayer3D extends THREE.Object3D {
         childList: true,
         subtree: true
       })
-
-      this._resizeObserver = new ResizeObserver((records, observer) => {
-        for (const record of records) {
-          const target = this.getLayerForElement(record.target)!
-          target.needsRefresh = true
-        }
-        this.refresh()
-      })
-      this._resizeObserver.observe(element)
 
       // stuff for rendering with html2canvas ¯\_(ツ)_/¯
       this._logger = new Logger(false)
@@ -274,6 +367,21 @@ export default class WebLayer3D extends THREE.Object3D {
         window
       )
     }
+
+    // technically this should only be needed in the root layer,
+    // however the polyfill seems to miss resizes that happen in child
+    // elements unless observing each layer
+    this._resizeObserver = new ResizeObserver(records => {
+      for (const record of records) {
+        const layer = this.getLayerForElement(record.target)!
+        if (
+          layer.element.offsetWidth !== layer.bounds.width ||
+          layer.element.offsetHeight !== layer.bounds.height
+        )
+          layer.needsRasterize = true
+      }
+    })
+    this._resizeObserver.observe(element)
 
     if (this.options.onLayerCreate) this.options.onLayerCreate(this)
   }
@@ -289,12 +397,22 @@ export default class WebLayer3D extends THREE.Object3D {
     return this._state
   }
 
+  get texture() {
+    const state = this._states[this.state] || this._states['']
+    return (state[this.hover] || state[0]).texture
+  }
+
+  get bounds() {
+    const state = this._states[this.state] || this._states['']
+    return (state[this.hover] || state[0]).bounds
+  }
+
   /**
    * A list of Rays to be used for interaction.
    * Can only be set on a root WebLayer3D instance.
    * @param rays
    */
-  set interactionRays(rays: THREE.Ray[] | undefined | null) {
+  set interactionRays(rays: THREE.Ray[]) {
     this._checkRoot()
     this._interactionRays = rays
   }
@@ -331,20 +449,36 @@ export default class WebLayer3D extends THREE.Object3D {
    * This should be called each frame, and can only be called on a root WebLayer3D instance.
    *
    * @param alpha lerp value
-   * @param children if true, also update child layers. Default is true.
    * @param transition transition function. Default is WebLayer3D.TRANSITION_DEFAULT
    */
   update(
     alpha = 1,
     transition: (layer: WebLayer3D, alpha: number) => void = WebLayer3D.TRANSITION_DEFAULT
   ) {
+    if (WebLayer3D.DEBUG) performance.mark('update start')
     alpha = Math.min(alpha, 1)
     this._isUpdating = true
     this._checkRoot()
+    WebLayer3D._updateInteractions(this)
+    if (WebLayer3D.DEBUG) performance.mark('update interactions end')
+    if (WebLayer3D.DEBUG) performance.mark('update refresh start')
     this.refresh()
-    this._updateInteractions()
+    if (WebLayer3D.DEBUG) performance.mark('update refresh end')
+    if (WebLayer3D.DEBUG) performance.mark('update transitions start')
     this.traverseLayers(transition, alpha)
+    if (WebLayer3D.DEBUG) performance.mark('update transitions end')
     this._isUpdating = false
+    WebLayer3D._scheduleRasterizations(this)
+    if (WebLayer3D.DEBUG) performance.mark('update end')
+    if (WebLayer3D.DEBUG)
+      performance.measure('update refresh', 'update refresh start', 'update refresh end')
+    if (WebLayer3D.DEBUG)
+      performance.measure(
+        'update transitions',
+        'update transitions start',
+        'update transitions end'
+      )
+    if (WebLayer3D.DEBUG) performance.measure('update', 'update start', 'update end')
   }
 
   traverseLayers<T extends any[]>(each: (layer: WebLayer3D, ...params: T) => void, ...params: T) {
@@ -378,21 +512,21 @@ export default class WebLayer3D extends THREE.Object3D {
   }
 
   hitTest(ray: THREE.Ray) {
+    this._checkRoot()
     this._raycaster.ray.copy(ray)
     this._hitIntersections.length = 0
     const intersections = this._raycaster.intersectObject(this, true, this._hitIntersections)
     for (const intersection of intersections) {
       const layer = this.rootLayer._meshMap!.get(intersection.object as any)
       if (!layer) continue
-      const layerBoundingRect = layer.boundingRect
+      const layerBoundingRect = layer.bounds
       if (!layerBoundingRect.width || !layerBoundingRect.height) continue
       let target = layer.element
       const clientX = intersection.uv!.x * layerBoundingRect.width
       const clientY = (1 - intersection.uv!.y) * layerBoundingRect.height
-      this._disableTransforms(true)
       traverseDOM(layer.element, el => {
         if (!target.contains(el)) return false
-        const elementBoundingRect = parseBounds(el, window.pageXOffset, window.pageYOffset)
+        const elementBoundingRect = getBounds(el)
         const offsetLeft = elementBoundingRect.left - layerBoundingRect.left
         const offsetTop = elementBoundingRect.top - layerBoundingRect.top
         const { width, height } = elementBoundingRect
@@ -409,34 +543,26 @@ export default class WebLayer3D extends THREE.Object3D {
         }
         return false // stop traversal down this path
       })
-      this._disableTransforms(false)
       return { layer, intersection, target }
     }
     return undefined
   }
 
-  async refresh(force = false): Promise<void> {
-    if (force) this.needsRefresh = true
+  refresh(forceRasterize = false) {
     this._updateState()
-    this._updateChildLayers()
-    this._updateDefaultLayout()
-
-    const refreshes = [] as Promise<void>[]
+    this._updateBounds()
+    if (this.needsRasterize || forceRasterize) {
+      this.needsRasterize = false
+      this._updateChildLayers()
+      if (this.rootLayer._rasterizationQueue.indexOf(this) === -1) {
+        this.rootLayer._rasterizationQueue.push(this)
+      }
+    }
     for (const child of this.children) {
-      if (child instanceof WebLayer3D) refreshes.push(child.refresh(force))
+      if (child instanceof WebLayer3D) child.refresh(forceRasterize)
     }
-    if (this.needsRefresh && !this._isRefreshing) {
-      this._isRefreshing = true
-      this.needsRefresh = false
-      await this._renderTextures()
-      this._isRefreshing = false
-      this._updateDefaultLayout()
-    }
-
+    this._updateTargetLayout()
     this._updateMesh()
-
-    await Promise.all(refreshes)
-    return
   }
 
   dispose() {
@@ -463,13 +589,35 @@ export default class WebLayer3D extends THREE.Object3D {
         : pixelRatioDefault
     this._pixelRatio = Math.max(pixelRatio, 10e-6)
 
-    this._states = (element.getAttribute(WebLayer3D.STATES_ATTRIBUTE) || '')
+    this._hoverDepth = parseInt(element.getAttribute(WebLayer3D.HOVER_DEPTH_ATTRIBUTE) || '0')
+
+    const states = (element.getAttribute(WebLayer3D.STATES_ATTRIBUTE) || '')
       .trim()
       .split(/\s+/)
       .filter(Boolean)
-    this._states.push('')
-    for (const state of this._states.slice()) {
-      this._states.push((state + ' hover').trim())
+    states.push('')
+
+    // cleanup unused textures
+    for (const stateKey in this._states) {
+      if (states.indexOf(stateKey) === -1) {
+        const hoverStates = this._states[stateKey]
+        for (const hoverState of hoverStates) {
+          hoverState.texture.dispose()
+        }
+        delete this._states[stateKey]
+      }
+    }
+
+    for (const stateKey of states) {
+      if (this._states[stateKey] === undefined) {
+        const hoverStates = (this._states[stateKey] = [] as any)
+        for (let i = 0; i <= this._hoverDepth; i++) {
+          hoverStates[i] = hoverStates[i] || {
+            texture: null,
+            bounds: {}
+          }
+        }
+      }
     }
   }
 
@@ -477,7 +625,11 @@ export default class WebLayer3D extends THREE.Object3D {
     if (this.rootLayer !== this) throw new Error('Only call `update` on a root WebLayer3D instance')
   }
 
-  private _updateDefaultLayout() {
+  private _updateBounds() {
+    getBounds(this.element, this.bounds)
+  }
+
+  private _updateTargetLayout() {
     this.targetContentPosition.copy(this._lastTargetContentPosition)
     this.targetContentScale.copy(this._lastTargetContentScale)
 
@@ -486,10 +638,7 @@ export default class WebLayer3D extends THREE.Object3D {
       return
     }
 
-    this._needsHiding = false
-    const rootBoundingRect = this.rootLayer.boundingRect
-    const boundingRect = this.boundingRect
-
+    const boundingRect = this.bounds
     if (
       boundingRect.width === 0 ||
       boundingRect.height === 0 ||
@@ -499,6 +648,8 @@ export default class WebLayer3D extends THREE.Object3D {
       return
     }
 
+    this._needsHiding = false
+    const rootBoundingRect = this.rootLayer.bounds
     const left = boundingRect.left - rootBoundingRect.left
     const top = boundingRect.top - rootBoundingRect.top
     const pixelSize = WebLayer3D.DEFAULT_PIXEL_DIMENSIONS
@@ -530,19 +681,8 @@ export default class WebLayer3D extends THREE.Object3D {
   }
 
   private _updateMesh() {
-    // cleanup unused textures
-    const states = this._states
-    for (const state in this.textures) {
-      if (!states.includes(state)) {
-        this.textures[state].dispose()
-        delete this.textures[state]
-      }
-    }
-
     const mesh = this.mesh
-    const textureID = (this.hover ? this.state + ' hover' : this.state).trim()
-    const fallbackTextureID = this.hover ? 'hover' : ''
-    const texture = this.textures[textureID] || this.textures[fallbackTextureID]
+    const texture = this.texture
 
     if (!texture) return
 
@@ -554,8 +694,8 @@ export default class WebLayer3D extends THREE.Object3D {
 
     if (!this.needsHiding && !mesh.parent) {
       this.content.add(mesh)
-      this._updateDefaultLayout()
-      // this.content.position.copy(this.defaultContentPosition)
+      this._updateTargetLayout()
+      this.content.position.copy(this.targetContentPosition)
       this.content.scale.copy(this.targetContentScale)
     }
 
@@ -564,28 +704,8 @@ export default class WebLayer3D extends THREE.Object3D {
     } else {
       mesh.visible = true
     }
-  }
 
-  private _updateInteractions() {
-    const interactionMap = this._interactionMap!
-    interactionMap.clear()
-    if (!this._interactionRays || this._interactionRays.length === 0) {
-      this.traverseLayers(WebLayer3D._updateInteraction, interactionMap)
-      return
-    }
-    interactions: for (const ray of this._interactionRays) {
-      this._hitIntersections.length = 0
-      this._raycaster.ray.copy(ray)
-      this._raycaster.intersectObject(this, true, this._hitIntersections)
-      for (const intersection of this._hitIntersections) {
-        const layer = this._meshMap!.get(intersection.object as any)
-        if (layer) {
-          interactionMap.set(layer, { point: intersection.point })
-          continue interactions
-        }
-      }
-    }
-    this.traverseLayers(WebLayer3D._updateInteraction, interactionMap)
+    mesh.renderOrder = this.level
   }
 
   private _showChildLayers(show: boolean) {
@@ -598,16 +718,31 @@ export default class WebLayer3D extends THREE.Object3D {
   }
 
   private _disableTransforms(disabled: boolean) {
-    const rootParent = this.rootLayer.element.parentElement!
-    if (disabled) rootParent.setAttribute(WebLayer3D.DISABLE_TRANSFORMS_ATTRIBUTE, '')
-    else rootParent.removeAttribute(WebLayer3D.DISABLE_TRANSFORMS_ATTRIBUTE)
+    if (disabled) {
+      this.rootLayer._processMutations(this.rootLayer._mutationObserver!.takeRecords())
+      document.documentElement.setAttribute(WebLayer3D.DISABLE_TRANSFORMS_ATTRIBUTE, '')
+    } else {
+      document.documentElement.removeAttribute(WebLayer3D.DISABLE_TRANSFORMS_ATTRIBUTE)
+      this.rootLayer._mutationObserver!.takeRecords()
+    }
   }
 
-  // private _markForRefresh() {
-  //   if (this._needsRefresh) return
-  //   this._needsRefresh = true
-  //   if (this.parent instanceof WebLayer3D) this.parent._markForRefresh()
-  // }
+  private _setHoverClasses(hover: number) {
+    let el = this.element as HTMLElement | null
+    let skip = hover - 1
+    while (el) {
+      if (hover === 0) {
+        if (el.classList.contains('hover')) el.classList.remove('hover')
+      } else if (skip === 0) {
+        if (!el.classList.contains('hover')) el.classList.add('hover')
+      } else {
+        skip--
+        el = this.parent && this.parent instanceof WebLayer3D ? this.parent.element : null
+        continue
+      }
+      el = el.parentElement
+    }
+  }
 
   private _markForRemoval() {
     this._needsRemoval = true
@@ -622,19 +757,19 @@ export default class WebLayer3D extends THREE.Object3D {
     const oldChildLayers = childLayers.slice()
 
     childLayers.length = 0
-    traverseDOM(element, this._tryConvertToWebLayer3D, this)
+    traverseDOM(element, this._tryConvertToWebLayer3D, this, this.level)
 
     for (const child of oldChildLayers) {
       if (childLayers.indexOf(child) === -1) child._markForRemoval()
     }
   }
 
-  private _tryConvertToWebLayer3D(el: HTMLElement) {
+  private _tryConvertToWebLayer3D(el: HTMLElement, level) {
     const id = el.getAttribute(WebLayer3D.LAYER_ATTRIBUTE)
-    if (id !== null) {
-      let child = this.getObjectById(parseInt(id, 10)) as WebLayer3D
+    if (id !== null || el.nodeName === 'video') {
+      let child = this.getObjectById(parseInt(id + '', 10)) as WebLayer3D
       if (!child) {
-        child = new WebLayer3D(el, this.options, this.rootLayer, this._level + 1)
+        child = new WebLayer3D(el, this.options, this.rootLayer, level)
         this.add(child)
       }
       this.childLayers.push(child)
@@ -643,74 +778,74 @@ export default class WebLayer3D extends THREE.Object3D {
     return true
   }
 
-  private async _renderTextures() {
+  private async _rasterize() {
     const element = this.element
-
-    const textures = this.textures
+    const states = this._states
     const renderFunctions = [] as Function[]
 
-    this._disableTransforms(true)
-    const bounds = (this.boundingRect = parseBounds(
-      element,
-      window.pageXOffset,
-      window.pageYOffset
-    ))
-    if (!bounds.width || !bounds.height) {
-      this._disableTransforms(false)
+    if (element.nodeName === 'video') {
+      const state = states[''][0]
+      state.bounds = getBounds(element)
+      state.texture = state.texture || new THREE.VideoTexture(element as HTMLVideoElement)
       return
     }
 
+    this._disableTransforms(true)
     this._showChildLayers(false)
 
-    for (const state of this._states) {
-      let texture = textures[state]
-      if (!texture) {
-        texture = new THREE.Texture(document.createElement('canvas'))
-        texture.anisotropy = 16
+    for (const stateKey in states) {
+      const hoverStates = states[stateKey]
+      let hoverDepth = this._hoverDepth
+
+      for (let hover = 0; hover <= hoverDepth; hover++) {
+        const state = hoverStates[hover]
+        const texture = state.texture || new THREE.Texture(document.createElement('canvas'))
+
+        if (stateKey) element.classList.add(stateKey)
+        this._setHoverClasses(hover)
+
+        const bounds = getBounds(element)
+        const stack = NodeParser(element, this.rootLayer._resourceLoader, this.rootLayer._logger)
+
+        if (stateKey) element.classList.remove(stateKey)
+        this._setHoverClasses(0)
+
+        if (!bounds.width || !bounds.height) continue
+        state.bounds = bounds
+
+        renderFunctions.push(() => {
+          const canvas = texture.image as HTMLCanvasElement
+          const context = canvas.getContext('2d')!
+          context.clearRect(0, 0, canvas.width, canvas.height)
+          const renderer = new Renderer(new CanvasRenderer(canvas), {
+            backgroundColor: null,
+            fontMetrics: this.rootLayer._fontMetrics,
+            imageStore,
+            logger: this.rootLayer._logger,
+            scale: this._pixelRatio,
+            x: bounds.left,
+            y: bounds.top,
+            width: bounds.width,
+            height: bounds.height,
+            allowTaint: this.options.allowTaint || false
+          })
+          renderer.render(stack)
+          if (!canvas.width || !canvas.height) {
+            canvas.width = 1
+            canvas.height = 1
+          }
+          texture.image = canvas
+          texture.minFilter = THREE.LinearFilter
+          texture.needsUpdate = true
+          state.texture = texture
+        })
       }
-
-      const classes = state && state.split(' ')
-      if (classes) element.classList.add(...classes)
-
-      const stack = NodeParser(element, this.rootLayer._resourceLoader, this.rootLayer._logger)
-
-      if (classes) element.classList.remove(...classes)
-
-      renderFunctions.push(() => {
-        const canvas = texture.image as HTMLCanvasElement
-        const context = canvas.getContext('2d')!
-        context.clearRect(0, 0, canvas.width, canvas.height)
-        const renderer = new Renderer(new CanvasRenderer(canvas), renderOptions)
-        renderer.render(stack)
-        if (!canvas.width || !canvas.height) {
-          canvas.width = 1
-          canvas.height = 1
-        }
-        texture.image = canvas
-        texture.minFilter = THREE.LinearFilter
-        texture.needsUpdate = true
-        textures[state] = texture
-      })
     }
 
     this._showChildLayers(true)
     this._disableTransforms(false)
-    this.rootLayer._processMutations(this.rootLayer._mutationObserver!.takeRecords())
 
     const imageStore = await this.rootLayer._resourceLoader.ready()
-
-    const renderOptions = {
-      backgroundColor: null,
-      fontMetrics: this.rootLayer._fontMetrics,
-      imageStore,
-      logger: this.rootLayer._logger,
-      scale: this._pixelRatio,
-      x: bounds.left,
-      y: bounds.top,
-      width: bounds.width,
-      height: bounds.height,
-      allowTaint: this.options.allowTaint || false
-    }
 
     for (const render of renderFunctions) render()
   }
@@ -735,21 +870,49 @@ function ensureElementIsInDocument(element: Element, options?: WebLayer3DOptions
   container.style.top = '-100000px'
 
   container.appendChild(element)
-  document.body
-    ? document.body.appendChild(container)
-    : document.documentElement.appendChild(container)
+  document.documentElement.appendChild(container)
   return element
 }
 
-function traverseDOM(node: Node, each: (node: HTMLElement) => boolean, bind?: any) {
+function traverseDOM(
+  node: Node,
+  each: (node: HTMLElement, level: number) => boolean,
+  bind?: any,
+  level = 0
+) {
+  level++
   for (let child: Node | null = node.firstChild; child; child = child.nextSibling) {
     if (child.nodeType === Node.ELEMENT_NODE) {
       const el = child as HTMLElement
-      if (each.call(bind, el)) {
-        traverseDOM(el, each, bind)
+      if (each.call(bind, el, level)) {
+        traverseDOM(el, each, bind, level)
       }
     }
   }
+}
+
+function getBounds(element: HTMLElement, bounds = { left: 0, top: 0, width: 0, height: 0 }) {
+  const window = element.ownerDocument!.defaultView!
+  let el = element
+  let left = el.offsetLeft
+  let top = el.offsetTop
+  let offsetParent = el.offsetParent
+  while (el && el.nodeType !== Node.DOCUMENT_NODE) {
+    left -= el.scrollLeft
+    top -= el.scrollTop
+    if (el === offsetParent) {
+      const style = window.getComputedStyle(el)
+      left += el.offsetLeft + parseFloat(style.borderLeftWidth!) || 0
+      top += el.offsetTop + parseFloat(style.borderTopWidth!) || 0
+      offsetParent = el.offsetParent
+    }
+    el = el.offsetParent as any
+  }
+  bounds.left = left + window.pageXOffset
+  bounds.top = top + window.pageYOffset
+  bounds.width = element.offsetWidth
+  bounds.height = element.offsetHeight
+  return bounds
 }
 
 function addCSSRule(sheet, selector, rules, index) {
@@ -758,4 +921,12 @@ function addCSSRule(sheet, selector, rules, index) {
   } else if ('addRule' in sheet) {
     sheet.addRule(selector, rules, index)
   }
+}
+
+function arraySubtract<T>(a: T[], b: T[]) {
+  const result = [] as T[]
+  for (const item of a) {
+    if (!b.includes(item)) result.push(item)
+  }
+  return result
 }
